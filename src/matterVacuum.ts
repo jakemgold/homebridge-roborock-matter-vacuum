@@ -175,6 +175,8 @@ export class RoborockMatterVacuum {
   private statusUpdateUnsubscribe?: () => void;
   private readonly commandRefreshTimers = new Set<NodeJS.Timeout>();
   private readonly startupRefreshTimers = new Set<NodeJS.Timeout>();
+  private accessory?: MatterAccessory;
+  private readonly defaultCleanModeValue: number;
   private selectedAreaIds: number[] = [];
   private lastKnownStatus?: RoborockStatus;
   private refreshInFlight = false;
@@ -196,7 +198,8 @@ export class RoborockMatterVacuum {
       ?? this.config.serialNumber
       ?? this.config.name;
     this.uuid = this.api.matter!.uuid.generate(`${PLUGIN_NAME}:${identity}`);
-    this.cleanModes = this.config.cleanModes?.length ? this.config.cleanModes : this.defaultCleanModes();
+    this.cleanModes = this.normalizeCleanModes(this.config.cleanModes?.length ? this.config.cleanModes : this.defaultCleanModes());
+    this.defaultCleanModeValue = this.resolveDefaultCleanMode();
     this.serviceMaps = this.normalizeServiceMaps(this.config.serviceMaps ?? this.serviceMapsFromAreas(this.config.serviceAreas ?? []));
     this.serviceAreas = this.normalizeServiceAreas(this.config.serviceAreas ?? []);
   }
@@ -286,10 +289,22 @@ export class RoborockMatterVacuum {
         manufacturer: this.config.manufacturer ?? 'Roborock',
         model: this.config.model ?? 'Roborock Vacuum',
         serialNumber: this.config.serialNumber ?? this.config.duid ?? this.config.id,
+        selectedAreaIds: this.selectedAreaIds,
       },
     } as unknown as MatterAccessory;
 
+    this.accessory = accessory;
     return accessory;
+  }
+
+  public restoreSelectedAreaIds(value: unknown): void {
+    if (!Array.isArray(value) || this.serviceAreas.length === 0) {
+      return;
+    }
+
+    const supportedAreaIds = new Set(this.serviceAreas.map((area) => area.areaId));
+    this.selectedAreaIds = [...new Set(value)]
+      .filter((areaId): areaId is number => typeof areaId === 'number' && Number.isInteger(areaId) && supportedAreaIds.has(areaId));
   }
 
   public startPolling(): void {
@@ -308,7 +323,6 @@ export class RoborockMatterVacuum {
       void this.refreshState();
     }, intervalSeconds * 1000);
 
-    void this.refreshState();
     this.scheduleStartupRefreshes();
   }
 
@@ -326,7 +340,9 @@ export class RoborockMatterVacuum {
 
   public destroy(): void {
     this.stopPolling();
-    this.client.destroy();
+    void Promise.resolve(this.client.destroy()).catch((error) => {
+      this.log.warn(`Failed to destroy Roborock client for ${this.config.name}: ${String(error)}`);
+    });
   }
 
   private async changeRunMode(newMode: number): Promise<void> {
@@ -456,7 +472,7 @@ export class RoborockMatterVacuum {
       return;
     }
 
-    const holdOptimisticState = source === 'refresh' && this.shouldHoldOptimisticState(status);
+    const holdOptimisticState = source !== 'optimistic' && this.shouldHoldOptimisticState(status);
     const effectiveStatus = holdOptimisticState
       ? { ...status, state: undefined }
       : status;
@@ -587,7 +603,7 @@ export class RoborockMatterVacuum {
       runMode: this.isCleaningState(status?.state) ? 1 : 0,
       cleanMode,
       operationalState: this.toOperationalState(status),
-      operationalError: this.toOperationalError(errorCode),
+      operationalError: this.toOperationalError(status, errorCode),
       powerSource: this.toPowerSourceState(status),
     };
   }
@@ -636,7 +652,7 @@ export class RoborockMatterVacuum {
       return BATTERY_CHARGE_STATE.Unknown;
     }
 
-    if ((status.state === 3 || status.state === 8) && battery !== undefined && battery >= 100) {
+    if (status.state === 100 || ((status.state === 3 || status.state === 8) && battery !== undefined && battery >= 100)) {
       return BATTERY_CHARGE_STATE.IsAtFullCharge;
     }
 
@@ -647,8 +663,26 @@ export class RoborockMatterVacuum {
     return BATTERY_CHARGE_STATE.IsNotCharging;
   }
 
-  private toOperationalError(errorCode: number): MatterClusterState {
+  private toOperationalError(status: RoborockStatus | undefined, errorCode: number): MatterClusterState {
     if (errorCode === 0) {
+      switch (status?.state) {
+        case 9:
+          return {
+            errorStateId: RVC_ERROR_STATES.UnableToCompleteOperation,
+            errorStateDetails: 'Roborock reported a charging problem.',
+          };
+        case 12:
+          return {
+            errorStateId: RVC_ERROR_STATES.UnableToCompleteOperation,
+            errorStateDetails: 'Roborock reported an error state.',
+          };
+        case 101:
+          return {
+            errorStateId: RVC_ERROR_STATES.UnableToCompleteOperation,
+            errorStateDetails: 'Roborock reports the vacuum is offline.',
+          };
+      }
+
       return { errorStateId: RVC_ERROR_STATES.NoError };
     }
 
@@ -671,6 +705,7 @@ export class RoborockMatterVacuum {
       case 18:
       case 22:
       case 23:
+      case 26:
         return RVC_OPERATIONAL_STATES.Running;
       case 6:
       case 15:
@@ -682,6 +717,12 @@ export class RoborockMatterVacuum {
         return RVC_OPERATIONAL_STATES.Charging;
       case 10:
         return RVC_OPERATIONAL_STATES.Paused;
+      case 9:
+      case 12:
+      case 101:
+        return RVC_OPERATIONAL_STATES.Error;
+      case 100:
+        return RVC_OPERATIONAL_STATES.Docked;
       case 3:
         return RVC_OPERATIONAL_STATES.Docked;
       default:
@@ -690,7 +731,7 @@ export class RoborockMatterVacuum {
   }
 
   private isCleaningState(state?: number): boolean {
-    return [5, 11, 16, 17, 18, 22, 23].includes(state ?? -1);
+    return [5, 11, 16, 17, 18, 22, 23, 26].includes(state ?? -1);
   }
 
   private defaultCleanModes(): CleanModeConfig[] {
@@ -757,7 +798,7 @@ export class RoborockMatterVacuum {
       .filter((match): match is { mode: number; score: number } => match !== undefined)
       .sort((left, right) => right.score - left.score);
 
-    return matches[0]?.mode ?? this.config.defaultCleanMode ?? this.cleanModes[0]?.mode ?? 0;
+    return matches[0]?.mode ?? this.defaultCleanModeValue;
   }
 
   private cleanModeAttributeScore(expected?: number, actual?: number): number {
@@ -967,23 +1008,119 @@ export class RoborockMatterVacuum {
     await this.api.matter?.updateAccessoryState(this.uuid, this.clusterName('ServiceArea', 'serviceArea'), {
       selectedAreas: this.selectedAreaIds,
     });
+    await this.persistSelectedAreaContext();
   }
 
   private normalizeServiceAreas(serviceAreas: ServiceAreaConfig[]): ServiceAreaConfig[] {
     const labelCounts = new Map<string, number>();
+    const seenAreaIds = new Set<number>();
+    const normalizedAreas: ServiceAreaConfig[] = [];
 
-    return serviceAreas.map((area) => {
+    for (const area of serviceAreas) {
+      if (!Number.isInteger(area.areaId)) {
+        this.log.warn(`Ignoring invalid service area for ${this.config.name}; areaId must be an integer.`);
+        continue;
+      }
+
+      if (seenAreaIds.has(area.areaId)) {
+        this.log.warn(`Ignoring duplicate service area ${area.areaId} for ${this.config.name}; Matter area IDs must be unique.`);
+        continue;
+      }
+
+      const label = typeof area.label === 'string' ? area.label.trim() : '';
+      if (!label) {
+        this.log.warn(`Ignoring service area ${area.areaId} for ${this.config.name}; label must be a non-empty string.`);
+        continue;
+      }
+
+      seenAreaIds.add(area.areaId);
       const mapId = this.areaMapId(area);
-      const labelKey = `${mapId}:${area.label}`;
+      const labelKey = `${mapId}:${label}`;
       const labelCount = labelCounts.get(labelKey) ?? 0;
       labelCounts.set(labelKey, labelCount + 1);
 
-      return {
+      normalizedAreas.push({
         ...area,
-        label: labelCount === 0 ? area.label : `${area.label} (${labelCount + 1})`,
+        label: labelCount === 0 ? label : `${label} (${labelCount + 1})`,
         mapId,
         mapName: area.mapName ?? this.serviceMaps.find((map) => map.mapId === mapId)?.name,
-      };
+      });
+    }
+
+    return normalizedAreas;
+  }
+
+  private normalizeCleanModes(cleanModes: CleanModeConfig[]): CleanModeConfig[] {
+    const seenModes = new Set<number>();
+    const normalizedModes: CleanModeConfig[] = [];
+
+    for (const mode of cleanModes) {
+      if (!Number.isInteger(mode.mode)) {
+        this.log.warn(`Ignoring invalid clean mode for ${this.config.name}; mode must be an integer.`);
+        continue;
+      }
+
+      if (seenModes.has(mode.mode)) {
+        this.log.warn(`Ignoring duplicate clean mode ${mode.mode} for ${this.config.name}; Matter mode IDs must be unique.`);
+        continue;
+      }
+
+      const label = typeof mode.label === 'string' ? mode.label.trim() : '';
+      if (!label) {
+        this.log.warn(`Ignoring clean mode ${mode.mode} for ${this.config.name}; label must be a non-empty string.`);
+        continue;
+      }
+
+      if (!this.isCleanModeTag(mode.tag)) {
+        this.log.warn(`Ignoring clean mode ${mode.mode} for ${this.config.name}; tag must be vacuum, mop, or vacuumAndMop.`);
+        continue;
+      }
+
+      seenModes.add(mode.mode);
+      normalizedModes.push({
+        ...mode,
+        label,
+      });
+    }
+
+    if (normalizedModes.length > 0) {
+      return normalizedModes;
+    }
+
+    this.log.warn(`No valid clean modes were configured for ${this.config.name}; using built-in Roborock clean modes.`);
+    return this.defaultCleanModes();
+  }
+
+  private isCleanModeTag(value: unknown): value is CleanModeConfig['tag'] {
+    return value === 'vacuum' || value === 'mop' || value === 'vacuumAndMop';
+  }
+
+  private resolveDefaultCleanMode(): number {
+    if (this.config.defaultCleanMode === undefined) {
+      return this.cleanModes[0]?.mode ?? 0;
+    }
+
+    if (this.cleanModes.some((mode) => mode.mode === this.config.defaultCleanMode)) {
+      return this.config.defaultCleanMode;
+    }
+
+    this.log.warn(`Ignoring default clean mode ${this.config.defaultCleanMode} for ${this.config.name}; it is not in supported clean modes.`);
+    return this.cleanModes[0]?.mode ?? 0;
+  }
+
+  private async persistSelectedAreaContext(): Promise<void> {
+    if (!this.accessory || !this.api.matter) {
+      return;
+    }
+
+    const context = (this.accessory as unknown as { context?: Record<string, unknown> }).context;
+    if (!context) {
+      return;
+    }
+
+    context.selectedAreaIds = this.selectedAreaIds;
+    await this.api.matter.updatePlatformAccessories([this.accessory]).catch((error) => {
+      this.log.debug(`Could not persist selected Roborock service areas for ${this.config.name}: ${String(error)}`);
     });
   }
 
@@ -1062,7 +1199,7 @@ export class RoborockMatterVacuum {
       await callback();
     } catch (error) {
       this.log.error(`Failed to ${action} for ${this.config.name}: ${String(error)}`);
-      throw new Error(`Failed to ${action}.`);
+      throw new Error(`Failed to ${action}.`, { cause: error });
     }
   }
 }

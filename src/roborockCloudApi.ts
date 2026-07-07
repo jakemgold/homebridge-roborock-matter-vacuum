@@ -6,6 +6,15 @@ import * as path from 'node:path';
 import * as mqtt from 'mqtt';
 import type { MqttClient } from 'mqtt';
 import { buf as crc32Buffer } from 'crc-32';
+import { formatRoborockError, RoborockRequestTimeoutError } from './roborockErrors';
+
+export {
+  formatRoborockError,
+  isCloudAckTimeout,
+  isRoborockRequestTimeoutError,
+  ROBOROCK_REQUEST_TIMEOUT_ERROR_CODE,
+  RoborockRequestTimeoutError,
+} from './roborockErrors';
 
 type RoborockLog = {
   debug(message: string): void;
@@ -162,6 +171,7 @@ export class RoborockCloudApi {
   private readonly pendingRequests = new Map<number, PendingRequest>();
   private readonly dpsUpdateListeners = new Set<RoborockDpsListener>();
   private readonly states: Record<string, PersistentState | undefined> = {};
+  private readonly persistedStateWrites = new Map<string, string>();
 
   private bInited = false;
   private loginApi?: AxiosInstance;
@@ -207,7 +217,7 @@ export class RoborockCloudApi {
 
     this.log.info('Starting Roborock cloud client.');
 
-    const clientID = await this.getOrCreateClientId();
+    const clientID = this.getOrCreateClientId();
 
     if (!this.config.username) {
       this.log.error('Roborock username is missing.');
@@ -222,18 +232,31 @@ export class RoborockCloudApi {
       language: this.language,
     });
 
-    const userData = await this.getUserData();
+    let userData = await this.getUserData();
     if (!userData) {
       this.log.error('Login failed or requires 2FA. Please complete authentication in the Config UI.');
       callback?.();
       return;
     }
 
-    this.setAuthorizationHeader(this.loginApi, userData.token);
-    this.api = this.createCloudApi(userData.rriot);
+    try {
+      await this.initializeSession(userData);
+    } catch (error) {
+      if (!this.isAuthFailure(error)) {
+        throw error;
+      }
 
-    await this.refreshHomeData(userData);
-    await this.rr_mqtt_connector.connect(userData);
+      this.log.warn('Cached Roborock session was rejected by the cloud API; clearing it and retrying login once.');
+      this.clearCachedSession();
+      userData = await this.getUserData();
+      if (!userData) {
+        this.log.error('Roborock session expired and no replacement session could be created. Add the password temporarily, restart Homebridge, then remove it after login succeeds.');
+        callback?.();
+        return;
+      }
+
+      await this.initializeSession(userData);
+    }
 
     this.bInited = true;
     this.log.info('Roborock cloud client is ready.');
@@ -258,6 +281,18 @@ export class RoborockCloudApi {
 
     await this.rr_mqtt_connector.disconnect();
     this.bInited = false;
+  }
+
+  private async initializeSession(userData: RoborockUserData): Promise<void> {
+    if (!this.loginApi) {
+      throw new Error('Login API is not initialized.');
+    }
+
+    this.setAuthorizationHeader(this.loginApi, userData.token);
+    this.api = this.createCloudApi(userData.rriot);
+
+    await this.refreshHomeData(userData);
+    await this.rr_mqtt_connector.connect(userData);
   }
 
   public getVacuumList(): RoborockCloudDevice[] {
@@ -348,7 +383,7 @@ export class RoborockCloudApi {
     if (loginResult.code === 200 && isValidUserData(loginResult.data)) {
       this.userData = loginResult.data;
       this.pendingAuth = undefined;
-      await this.setStateAsync('UserData', {
+      this.setStateAsync('UserData', {
         val: JSON.stringify(this.userData),
         ack: true,
       });
@@ -410,7 +445,7 @@ export class RoborockCloudApi {
       return this.userData;
     }
 
-    const cachedState = await this.getStateAsync('UserData');
+    const cachedState = this.getStateAsync('UserData');
     const cachedValue = this.parseStateJson(cachedState);
     if (isValidUserData(cachedValue)) {
       this.userData = cachedValue;
@@ -438,7 +473,7 @@ export class RoborockCloudApi {
     if (loginResult.code === 200 && isValidUserData(loginResult.data)) {
       this.userData = loginResult.data;
       this.pendingAuth = undefined;
-      await this.setStateAsync('UserData', {
+      this.setStateAsync('UserData', {
         val: JSON.stringify(this.userData),
         ack: true,
       });
@@ -454,9 +489,25 @@ export class RoborockCloudApi {
       return null;
     }
 
-    await this.deleteStateAsync('HomeData');
-    await this.deleteStateAsync('UserData');
+    this.deleteStateAsync('HomeData');
+    this.deleteStateAsync('UserData');
     throw new Error(`Roborock login failed: ${formatLoginFailure(loginResult)}`);
+  }
+
+  private clearCachedSession(): void {
+    this.userData = undefined;
+    this.api = undefined;
+    if (this.loginApi) {
+      const commonHeaders = this.loginApi.defaults.headers.common as Record<string, string | undefined>;
+      delete commonHeaders.Authorization;
+    }
+    this.deleteStateAsync('HomeData');
+    this.deleteStateAsync('UserData');
+  }
+
+  private isAuthFailure(error: unknown): boolean {
+    return axios.isAxiosError(error)
+      && (error.response?.status === 401 || error.response?.status === 403);
   }
 
   private async ensureAuthSignature(): Promise<LoginSignature> {
@@ -532,7 +583,7 @@ export class RoborockCloudApi {
 
     const homeDataResponse = await this.api.get(`v2/user/homes/${homeId}`);
     const homeData = this.extractHomeData(homeDataResponse.data);
-    await this.setStateAsync('HomeData', {
+    this.setStateAsync('HomeData', {
       val: JSON.stringify(homeData),
       ack: true,
     });
@@ -561,7 +612,7 @@ export class RoborockCloudApi {
     const interval = Math.max(this.updateInterval, 60) * 1000;
     this.homeDataRefreshInterval = setInterval(() => {
       this.refreshHomeData(userData).catch((error) => {
-        this.log.debug(`Roborock home data refresh failed: ${formatError(error)}`);
+        this.log.debug(`Roborock home data refresh failed: ${formatRoborockError(error)}`);
       });
     }, interval);
     this.homeDataRefreshInterval.unref();
@@ -680,14 +731,14 @@ export class RoborockCloudApi {
     );
   }
 
-  private async getOrCreateClientId(): Promise<string> {
-    const stored = await this.getStateAsync('clientID');
+  private getOrCreateClientId(): string {
+    const stored = this.getStateAsync('clientID');
     if (typeof stored?.val === 'string' && stored.val.length > 0) {
       return stored.val;
     }
 
     const clientID = crypto.randomUUID();
-    await this.setStateAsync('clientID', { val: clientID, ack: true });
+    this.setStateAsync('clientID', { val: clientID, ack: true });
     return clientID;
   }
 
@@ -702,14 +753,16 @@ export class RoborockCloudApi {
         return null;
       }
 
-      return JSON.parse(fs.readFileSync(persistPath, 'utf8')) as PersistentState;
+      const raw = fs.readFileSync(persistPath, 'utf8');
+      this.persistedStateWrites.set(id, raw);
+      return JSON.parse(raw) as PersistentState;
     } catch (error) {
-      this.log.debug(`Could not read Roborock state ${id}: ${formatError(error)}`);
+      this.log.debug(`Could not read Roborock state ${id}: ${formatRoborockError(error)}`);
       return null;
     }
   }
 
-  private async setStateAsync(id: string, state: PersistentState): Promise<void> {
+  private setStateAsync(id: string, state: PersistentState): void {
     this.states[id] = state;
 
     if (!PERSISTED_STATE_IDS.has(id)) {
@@ -717,15 +770,21 @@ export class RoborockCloudApi {
     }
 
     const persistPath = this.getPersistPath(id);
+    const serialized = JSON.stringify(state, null, 2);
+    if (this.persistedStateWrites.get(id) === serialized) {
+      return;
+    }
+
     fs.mkdirSync(path.dirname(persistPath), { recursive: true, mode: PRIVATE_DIRECTORY_MODE });
-    fs.writeFileSync(persistPath, JSON.stringify(state, null, 2), {
+    fs.writeFileSync(persistPath, serialized, {
       encoding: 'utf8',
       mode: PRIVATE_FILE_MODE,
     });
+    this.persistedStateWrites.set(id, serialized);
     this.restrictFilePermissions(persistPath);
   }
 
-  private async deleteStateAsync(id: string): Promise<void> {
+  private deleteStateAsync(id: string): void {
     delete this.states[id];
 
     if (!PERSISTED_STATE_IDS.has(id)) {
@@ -733,6 +792,7 @@ export class RoborockCloudApi {
     }
 
     const persistPath = this.getPersistPath(id);
+    this.persistedStateWrites.delete(id);
     if (fs.existsSync(persistPath)) {
       fs.unlinkSync(persistPath);
     }
@@ -773,7 +833,7 @@ export class RoborockCloudApi {
         this.persistBasePath = resolved;
         return resolved;
       } catch (error) {
-        this.log.debug(`Roborock persist path '${candidate}' is not writable: ${formatError(error)}`);
+        this.log.debug(`Roborock persist path '${candidate}' is not writable: ${formatRoborockError(error)}`);
       }
     }
 
@@ -787,7 +847,7 @@ export class RoborockCloudApi {
     try {
       fs.chmodSync(filePath, PRIVATE_FILE_MODE);
     } catch (error) {
-      this.log.debug(`Could not restrict Roborock persisted state permissions: ${formatError(error)}`);
+      this.log.debug(`Could not restrict Roborock persisted state permissions: ${formatRoborockError(error)}`);
     }
   }
 
@@ -818,7 +878,7 @@ class RoborockMessageQueue {
     return new Promise<unknown>((resolve, reject) => {
       const timeout = setTimeout(() => {
         this.api.takePendingRequest(messageID);
-        reject(new Error(`Cloud request with id ${messageID} with method ${method} timed out after 10 seconds. MQTT connection state: ${this.api.rr_mqtt_connector.isConnected()}`));
+        reject(new RoborockRequestTimeoutError(messageID, method, this.api.rr_mqtt_connector.isConnected(), REQUEST_TIMEOUT_MS));
       }, REQUEST_TIMEOUT_MS);
 
       this.api.addPendingRequest(messageID, {
@@ -833,7 +893,7 @@ class RoborockMessageQueue {
       } catch (error) {
         clearTimeout(timeout);
         this.api.takePendingRequest(messageID);
-        reject(error);
+        reject(error instanceof Error ? error : new Error(formatRoborockError(error)));
       }
     });
   }
@@ -882,7 +942,7 @@ class RoborockMqttConnector {
     });
     this.client.on('error', (error) => {
       this.connected = false;
-      this.api.log.warn(`Roborock MQTT connection error: ${formatError(error)}`);
+      this.api.log.warn(`Roborock MQTT connection error: ${formatRoborockError(error)}`);
     });
     this.client.on('message', (topic, message) => {
       this.handleMessage(topic, message);
@@ -928,7 +988,7 @@ class RoborockMqttConnector {
     const topic = `rr/m/o/${this.userData.rriot.u}/${this.mqttUser}/#`;
     this.client.subscribe(topic, { qos: 1 }, (error) => {
       if (error) {
-        this.api.log.warn(`Failed to subscribe to Roborock MQTT topic: ${formatError(error)}`);
+        this.api.log.warn(`Failed to subscribe to Roborock MQTT topic: ${formatRoborockError(error)}`);
       }
     });
   }
@@ -976,7 +1036,7 @@ class RoborockMqttConnector {
 
       pending.resolve(dps.result);
     } catch (error) {
-      this.api.log.warn(`Failed to process Roborock MQTT message: ${formatError(error)}`);
+      this.api.log.warn(`Failed to process Roborock MQTT message: ${formatRoborockError(error)}`);
     }
   }
 
@@ -1006,8 +1066,8 @@ class RoborockMqttConnector {
 
   private formatDpsError(dps: DecodedDps): string {
     const details = [
-      dps.code === undefined ? undefined : `code=${String(dps.code)}`,
-      dps.error === undefined ? undefined : `error=${String(dps.error)}`,
+      dps.code === undefined ? undefined : `code=${formatRoborockError(dps.code, 'unknown')}`,
+      dps.error === undefined ? undefined : `error=${formatRoborockError(dps.error, 'unknown')}`,
     ].filter((detail): detail is string => detail !== undefined);
 
     return details.length > 0 ? details.join(', ') : 'unknown device error';
@@ -1133,7 +1193,8 @@ class RoborockMessageCodec {
       return parsed;
     } catch (error) {
       if (!this.missingLocalKeyWarnings.has(duid)) {
-        this.api.log.debug(`Could not decode Roborock MQTT message for ${maskIdentifier(duid)}: ${formatError(error)}`);
+        this.missingLocalKeyWarnings.add(duid);
+        this.api.log.debug(`Could not decode Roborock MQTT message for ${maskIdentifier(duid)}: ${formatRoborockError(error)}`);
       }
       return null;
     }
@@ -1196,7 +1257,6 @@ class RoborockMessageCodec {
       return localKey;
     }
 
-    this.missingLocalKeyWarnings.add(duid);
     throw new Error(`No localKey found for device ${maskIdentifier(duid)}`);
   }
 
@@ -1239,7 +1299,10 @@ async function requestEmailCode(loginApi: AxiosInstance, email: string): Promise
 
   const response = await loginApi.post(API_V4_EMAIL_CODE, params.toString());
   if (isRecord(response.data) && response.data.code !== 200) {
-    throw new Error(`Send code failed: ${response.data.msg ?? 'Unknown error'} (Code: ${response.data.code})`);
+    throw new Error(
+      `Send code failed: ${formatRoborockError(response.data.msg, 'Unknown error')} `
+      + `(Code: ${formatRoborockError(response.data.code, 'unknown')})`,
+    );
   }
 
   return response.data;
@@ -1342,10 +1405,6 @@ function md5bin(value: string): Buffer {
 
 function md5hex(value: string): string {
   return crypto.createHash('md5').update(value).digest('hex');
-}
-
-function formatError(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
 }
 
 function formatLoginFailure(result: LoginResult): string {

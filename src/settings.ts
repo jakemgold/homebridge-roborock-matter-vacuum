@@ -29,6 +29,8 @@ export interface RoborockMatterConfig extends PlatformConfig {
   language?: string;
   skipDevices?: string[];
   pollingIntervalSeconds?: number;
+  forceRoomRediscovery?: boolean;
+  roomDiscoveryCacheTtlHours?: number;
   vacuums?: RoborockVacuumConfig[];
 }
 
@@ -43,6 +45,8 @@ export interface RoborockVacuumConfig {
   cleanModes?: CleanModeConfig[];
   enableMoppingModes?: boolean;
   defaultCleanMode?: number;
+  forceRoomRediscovery?: boolean;
+  roomDiscoveryCacheTtlHours?: number;
   segmentCleanPayload?: SegmentCleanPayload;
   roomNameOverrides?: RoomNameOverrideConfig[];
   roomNamesByMap?: Record<string, string[]>;

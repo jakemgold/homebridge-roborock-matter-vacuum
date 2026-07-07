@@ -79,13 +79,13 @@ npm install -g homebridge-roborock-matter-vacuum
 For a beta tarball build:
 
 ```sh
-npm install -g ./homebridge-roborock-matter-vacuum-0.5.1.tgz
+npm install -g ./homebridge-roborock-matter-vacuum-0.6.0.tgz
 ```
 
 If the tarball is hosted from another machine:
 
 ```sh
-npm install -g http://HOST:PORT/homebridge-roborock-matter-vacuum-0.5.1.tgz
+npm install -g http://HOST:PORT/homebridge-roborock-matter-vacuum-0.6.0.tgz
 ```
 
 Restart Homebridge after installing or updating the plugin.
@@ -170,6 +170,21 @@ For a quicker but order-sensitive override, use `roomNamesByMap`:
 
 Exact `roomNameOverrides` win over `roomNamesByMap`. Restart Homebridge after changing labels; Apple Home may need to be reopened to refresh the picker.
 
+### Advanced Room Rediscovery
+
+Room and map discovery is cached for 24 hours by default. This avoids physically switching saved Roborock maps on every Homebridge restart.
+
+If you rename rooms or maps in the Roborock app and need a refresh sooner, temporarily add `forceRoomRediscovery` to the platform or a single vacuum, restart Homebridge once, then remove it:
+
+```json
+{
+  "platform": "RoborockMatter",
+  "forceRoomRediscovery": true
+}
+```
+
+Manual JSON users can also set `roomDiscoveryCacheTtlHours` on the platform or a single vacuum. Set it to `0` to run live room discovery on every startup.
+
 ## Matter Pairing
 
 This plugin publishes the vacuum as a Matter accessory. It is paired separately from the normal Homebridge HomeKit bridge.
@@ -205,9 +220,10 @@ Apple Home currently exposes controls such as start, pause, return to dock, batt
 - Cloud mode is currently the only supported connection mode.
 - Local miIO IP/token control was intentionally removed from the public beta path to avoid shipping old vulnerable dependencies.
 - Matter robotic vacuum support varies by controller. Apple Home, Google Home, Alexa, and SmartThings may expose different controls.
-- Multi-floor room discovery uses saved Roborock maps where available. During discovery, the plugin may briefly switch maps only while the vacuum appears idle, then caches the room list for future startups.
+- Multi-floor room discovery uses saved Roborock maps where available. During live discovery, the plugin may briefly switch maps only while the vacuum appears idle. The discovered room list is cached for 24 hours by default, so normal restarts should not switch maps.
 - Some Roborock models report saved map names but reuse the same room-name mapping for every map. When that happens, the plugin keeps the stable discovered room names and uses generic room labels for maps with stale data; exact per-floor room names may require `roomNameOverrides` or `roomNamesByMap`.
 - Room selections must be on one Roborock map/floor at a time; the robot cannot clean rooms from multiple saved maps in a single command.
+- If a selected room clean requires switching Roborock maps, the plugin waits for Roborock to confirm the new map before sending the clean command. Apple Home may show the command as accepted before the robot physically starts.
 - Roborock command acknowledgements can be slow or missing. The plugin returns quickly to Matter for responsiveness and logs late failures when Roborock reports them.
 - Apple Home may briefly show the vacuum as a small generic Matter tile with a house icon after app launch, Home hub changes, or accessory cache refreshes. Opening the tile usually prompts Apple Home to finish reading the Matter device type and redraw it as a robotic vacuum.
 - Changing supported Matter modes or rooms may require restarting Homebridge and, in some cases, removing and re-adding the Matter accessory.

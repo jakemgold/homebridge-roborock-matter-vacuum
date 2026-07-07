@@ -1,8 +1,13 @@
 import type { Logger } from 'homebridge';
 import * as fs from 'node:fs/promises';
 import * as path from 'node:path';
-import { RoborockCloudApi as Roborock, type RoborockCloudDevice, type RoborockDpsUpdate } from './roborockCloudApi';
+import {
+  RoborockCloudApi as Roborock,
+  type RoborockCloudDevice,
+  type RoborockDpsUpdate,
+} from './roborockCloudApi';
 import type { RoborockStatus, RoborockStatusListener, RoborockVacuumClient } from './roborockClient';
+import { formatRoborockError, isCloudAckTimeout } from './roborockErrors';
 import type {
   CleanModeConfig,
   RoborockCloudRegion,
@@ -72,10 +77,13 @@ const SERVICE_AREA_CACHE_VERSION = 9;
 const PRIVATE_CACHE_DIRECTORY_MODE = 0o700;
 const PRIVATE_CACHE_FILE_MODE = 0o600;
 const MAP_AREA_ID_MULTIPLIER = 100_000;
+const DEFAULT_ROOM_DISCOVERY_CACHE_TTL_HOURS = 24;
+const MS_PER_HOUR = 60 * 60 * 1000;
 const MAP_DISCOVERY_SETTLE_MS = 3_000;
 const MAP_DISCOVERY_UNCONFIRMED_SETTLE_MS = 10_000;
 const MAP_DISCOVERY_CONFIRM_TIMEOUT_MS = 18_000;
 const MAP_DISCOVERY_CONFIRM_INTERVAL_MS = 2_000;
+const COMMAND_MAP_STATUS_TIMEOUT_MS = 2_000;
 const ROOM_MAPPING_STALE_RETRY_TIMEOUT_MS = 15_000;
 const ROOM_MAPPING_STALE_RETRY_INTERVAL_MS = 3_000;
 const ROBOROCK_NO_MAP_ID = 63;
@@ -183,18 +191,23 @@ export class RoborockCloudConnection {
     }
 
     const registrations: CloudVacuumRegistration[] = [];
+    const roborock = this.roborock;
 
-    for (const device of this.roborock.getVacuumList().filter((candidate) => this.isSupportedVacuum(candidate))) {
+    for (const device of roborock.getVacuumList().filter((candidate) => this.isSupportedVacuum(candidate))) {
       const override = this.findOverride(device);
       const vacuumConfig = await this.toVacuumConfig(device, override);
 
       registrations.push({
         config: vacuumConfig,
-        client: new RoborockCloudVacuumClient(this.roborock!, vacuumConfig, this.log, this.deviceOperations),
+        client: new RoborockCloudVacuumClient(roborock, vacuumConfig, this.log, this.deviceOperations),
       });
     }
 
     return registrations;
+  }
+
+  public isStarted(): boolean {
+    return this.roborock?.isInited() ?? false;
   }
 
   public async destroy(): Promise<void> {
@@ -205,7 +218,8 @@ export class RoborockCloudConnection {
   }
 
   private async startRoborockService(): Promise<void> {
-    if (!this.roborock) {
+    const roborock = this.roborock;
+    if (!roborock) {
       return;
     }
 
@@ -233,8 +247,8 @@ export class RoborockCloudConnection {
         settle(() => reject(new Error('Roborock cloud initialization timed out.')));
       }, 60_000);
 
-      this.roborock!.startService(() => settle(resolve)).catch((error) => {
-        settle(() => reject(error));
+      roborock.startService(() => settle(resolve)).catch((error) => {
+        settle(() => reject(error instanceof Error ? error : new Error(formatRoborockError(error))));
       });
     });
   }
@@ -283,7 +297,7 @@ export class RoborockCloudConnection {
         serviceAreas: override.serviceAreas,
         serviceMaps: override.serviceMaps ?? this.serviceMapsFromAreas(override.serviceAreas, override.name ?? device.name),
       }
-      : await this.discoverServiceAreas(device);
+      : await this.discoverServiceAreas(device, override);
     const discovered = this.applyConfiguredRoomNameOverrides(rawDiscovery, override, device);
 
     return {
@@ -299,12 +313,15 @@ export class RoborockCloudConnection {
     };
   }
 
-  private async discoverServiceAreas(device: RoborockCloudDevice): Promise<ServiceAreaDiscovery> {
+  private async discoverServiceAreas(device: RoborockCloudDevice, override?: RoborockVacuumConfig): Promise<ServiceAreaDiscovery> {
     if (!this.roborock?.isInited() || !device.duid) {
       return this.emptyDiscovery();
     }
 
     const cached = await this.readServiceAreaCache(device.duid);
+    if (this.shouldUseCachedServiceAreas(device, cached, override)) {
+      return this.cachedOrEmpty(device, cached);
+    }
 
     try {
       const adapter = this.roborock;
@@ -337,7 +354,7 @@ export class RoborockCloudConnection {
       this.logServiceAreaDiscovery(device, currentMapDiscovery);
       return currentMapDiscovery;
     } catch (error) {
-      this.log.warn(`Could not discover Roborock rooms for ${this.deviceLabel(device)}. ${this.formatError(error)}`);
+      this.log.warn(`Could not discover Roborock rooms for ${this.deviceLabel(device)}. ${formatRoborockError(error)}`);
       return this.cachedOrEmpty(device, cached);
     }
   }
@@ -563,7 +580,7 @@ export class RoborockCloudConnection {
     } finally {
       if (originalMapId !== undefined && activeMapId !== undefined && activeMapId !== originalMapId) {
         await this.loadRoborockMap(device, originalMapId).catch((error) => {
-          this.log.warn(`Could not restore original Roborock map for ${this.deviceLabel(device)}. ${this.formatError(error)}`);
+          this.log.warn(`Could not restore original Roborock map for ${this.deviceLabel(device)}. ${formatRoborockError(error)}`);
         });
       }
     }
@@ -654,7 +671,7 @@ export class RoborockCloudConnection {
     try {
       await this.roborock?.refreshHomeDataNow();
     } catch (error) {
-      this.log.debug(`Could not refresh Roborock room names for ${this.deviceLabel(device)}. ${this.formatError(error)}`);
+      this.log.debug(`Could not refresh Roborock room names for ${this.deviceLabel(device)}. ${formatRoborockError(error)}`);
     }
   }
 
@@ -663,7 +680,7 @@ export class RoborockCloudConnection {
       const payload = await this.sendRequestWithRetry(device.duid, 'get_multi_maps_list', [], 'discover Roborock saved maps', 2);
       return this.multiMapPayloadToMaps(payload);
     } catch (error) {
-      this.log.debug(`Could not discover Roborock saved maps for ${this.deviceLabel(device)}; falling back to current-map rooms. ${this.formatError(error)}`);
+      this.log.debug(`Could not discover Roborock saved maps for ${this.deviceLabel(device)}; falling back to current-map rooms. ${formatRoborockError(error)}`);
       return [];
     }
   }
@@ -859,14 +876,14 @@ export class RoborockCloudConnection {
       const payload = await this.sendRequestWithRetry(device.duid, statusRequest.method, statusRequest.params, 'read Roborock status', 1);
       return this.normalizeStatus(payload);
     } catch (error) {
-      this.log.debug(`Could not read Roborock status for ${this.deviceLabel(device)} during room discovery. ${this.formatError(error)}`);
+      this.log.debug(`Could not read Roborock status for ${this.deviceLabel(device)} during room discovery. ${formatRoborockError(error)}`);
     }
 
     try {
       const payload = await this.sendRequestWithRetry(device.duid, statusRequest.fallbackMethod, statusRequest.fallbackParams, 'read Roborock status', 1);
       return this.normalizeStatus(payload);
     } catch (error) {
-      this.log.debug(`Could not read fallback Roborock status for ${this.deviceLabel(device)} during room discovery. ${this.formatError(error)}`);
+      this.log.debug(`Could not read fallback Roborock status for ${this.deviceLabel(device)} during room discovery. ${formatRoborockError(error)}`);
       return undefined;
     }
   }
@@ -897,7 +914,7 @@ export class RoborockCloudConnection {
     try {
       await this.sendRequestWithRetry(device.duid, 'load_multi_map', [mapId], `load Roborock map ${mapId}`, 1);
     } catch (error) {
-      if (!this.isCloudAckTimeout(error, 'load_multi_map')) {
+      if (!isCloudAckTimeout(error, 'load_multi_map')) {
         throw error;
       }
 
@@ -1234,6 +1251,69 @@ export class RoborockCloudConnection {
     return { serviceAreas: [], serviceMaps: [] };
   }
 
+  private shouldUseCachedServiceAreas(
+    device: RoborockCloudDevice,
+    cached: CachedServiceAreaDiscovery | undefined,
+    override?: RoborockVacuumConfig,
+  ): boolean {
+    if (!cached?.serviceAreas.length) {
+      return false;
+    }
+
+    if (this.shouldForceRoomRediscovery(override)) {
+      this.log.info(`Roborock room rediscovery is forced for ${this.deviceLabel(device)}; ignoring cached room discovery from ${cached.updatedAt}.`);
+      return false;
+    }
+
+    const ttlMs = this.roomDiscoveryCacheTtlMs(override);
+    if (ttlMs <= 0) {
+      this.log.debug(`Roborock room discovery cache is disabled for ${this.deviceLabel(device)}; running live discovery.`);
+      return false;
+    }
+
+    const updatedAtMs = Date.parse(cached.updatedAt);
+    if (!Number.isFinite(updatedAtMs)) {
+      this.log.debug(`Roborock room cache for ${this.deviceLabel(device)} has no valid timestamp; running live discovery.`);
+      return false;
+    }
+
+    const ageMs = Math.max(0, Date.now() - updatedAtMs);
+    if (ageMs > ttlMs) {
+      this.log.info(
+        `Roborock room cache for ${this.deviceLabel(device)} is ${this.formatDuration(ageMs)} old; `
+        + `running live discovery because the TTL is ${this.formatDuration(ttlMs)}.`,
+      );
+      return false;
+    }
+
+    return true;
+  }
+
+  private shouldForceRoomRediscovery(override?: RoborockVacuumConfig): boolean {
+    return override?.forceRoomRediscovery ?? this.config.forceRoomRediscovery ?? false;
+  }
+
+  private roomDiscoveryCacheTtlMs(override?: RoborockVacuumConfig): number {
+    const hours = override?.roomDiscoveryCacheTtlHours
+      ?? this.config.roomDiscoveryCacheTtlHours
+      ?? DEFAULT_ROOM_DISCOVERY_CACHE_TTL_HOURS;
+
+    if (typeof hours !== 'number' || !Number.isFinite(hours)) {
+      return DEFAULT_ROOM_DISCOVERY_CACHE_TTL_HOURS * MS_PER_HOUR;
+    }
+
+    return Math.max(0, hours) * MS_PER_HOUR;
+  }
+
+  private formatDuration(ms: number): string {
+    const hours = ms / MS_PER_HOUR;
+    if (hours < 1) {
+      return `${Math.max(1, Math.round(hours * 60))}m`;
+    }
+
+    return `${Math.round(hours * 10) / 10}h`;
+  }
+
   private cachedOrEmpty(device: RoborockCloudDevice, cached?: CachedServiceAreaDiscovery): ServiceAreaDiscovery {
     if (cached?.serviceAreas.length) {
       this.log.info(`Using cached Roborock room discovery for ${this.deviceLabel(device)} from ${cached.updatedAt}.`);
@@ -1269,7 +1349,7 @@ export class RoborockCloudConnection {
 
       if (cache.version !== SERVICE_AREA_CACHE_VERSION) {
         this.log.debug(
-          `Using legacy Roborock room cache schema ${String(cache.version ?? 'unknown')}; `
+          `Using legacy Roborock room cache schema ${formatRoborockError(cache.version, 'unknown')}; `
           + 'the cache will be migrated after the next successful discovery.',
         );
       }
@@ -1280,7 +1360,7 @@ export class RoborockCloudConnection {
         return undefined;
       }
 
-      this.log.debug(`Could not read Roborock room cache. ${this.formatError(error)}`);
+      this.log.debug(`Could not read Roborock room cache. ${formatRoborockError(error)}`);
       return undefined;
     }
   }
@@ -1304,7 +1384,7 @@ export class RoborockCloudConnection {
       }
     } catch (error) {
       if (!this.isFileMissingError(error)) {
-        this.log.debug(`Could not read existing Roborock room cache before writing. ${this.formatError(error)}`);
+        this.log.debug(`Could not read existing Roborock room cache before writing. ${formatRoborockError(error)}`);
       }
     }
 
@@ -1322,7 +1402,7 @@ export class RoborockCloudConnection {
       });
       await this.restrictCacheFilePermissions(cachePath);
     } catch (error) {
-      this.log.debug(`Could not write Roborock room cache. ${this.formatError(error)}`);
+      this.log.debug(`Could not write Roborock room cache. ${formatRoborockError(error)}`);
     }
   }
 
@@ -1331,15 +1411,118 @@ export class RoborockCloudConnection {
       return undefined;
     }
 
-    const serviceAreas = value.serviceAreas as ServiceAreaConfig[];
+    const serviceAreas = this.normalizeCachedServiceAreas(value.serviceAreas);
+    if (serviceAreas.length === 0) {
+      return undefined;
+    }
 
     return {
       serviceAreas,
-      serviceMaps: Array.isArray(value.serviceMaps)
-        ? value.serviceMaps as ServiceMapConfig[]
-        : this.serviceMapsFromAreas(serviceAreas),
+      serviceMaps: this.normalizeCachedServiceMaps(value.serviceMaps, serviceAreas),
       updatedAt: typeof value.updatedAt === 'string' ? value.updatedAt : 'unknown time',
     };
+  }
+
+  private normalizeCachedServiceAreas(value: unknown[]): ServiceAreaConfig[] {
+    const seenAreaIds = new Set<number>();
+    const serviceAreas: ServiceAreaConfig[] = [];
+
+    for (const entry of value) {
+      if (!this.isRecord(entry)) {
+        continue;
+      }
+
+      const areaId = this.toInteger(entry.areaId);
+      const label = this.toNonEmptyString(entry.label);
+
+      if (areaId === undefined || !label || seenAreaIds.has(areaId)) {
+        continue;
+      }
+
+      seenAreaIds.add(areaId);
+      serviceAreas.push(this.cachedServiceArea(entry, areaId, label));
+    }
+
+    return serviceAreas;
+  }
+
+  private cachedServiceArea(entry: Record<string, unknown>, areaId: number, label: string): ServiceAreaConfig {
+    const serviceArea: ServiceAreaConfig = { areaId, label };
+    const kind = entry.kind === 'room' || entry.kind === 'zone' ? entry.kind : undefined;
+    const mapId = this.toInteger(entry.mapId);
+    const roborockMapId = this.toInteger(entry.roborockMapId);
+    const segmentId = this.toInteger(entry.segmentId);
+    const repeat = this.toInteger(entry.repeat);
+    const mapName = this.toNonEmptyString(entry.mapName);
+    const roomId = this.toNonEmptyString(entry.roomId);
+    const coordinates = this.cachedCoordinates(entry.coordinates);
+
+    if (kind) {
+      serviceArea.kind = kind;
+    }
+    if (mapId !== undefined) {
+      serviceArea.mapId = mapId;
+    }
+    if (mapName) {
+      serviceArea.mapName = mapName;
+    }
+    if (roborockMapId !== undefined) {
+      serviceArea.roborockMapId = roborockMapId;
+    }
+    if (segmentId !== undefined) {
+      serviceArea.segmentId = segmentId;
+    }
+    if (roomId) {
+      serviceArea.roomId = roomId;
+    }
+    if (coordinates) {
+      serviceArea.coordinates = coordinates;
+    }
+    if (repeat !== undefined) {
+      serviceArea.repeat = repeat;
+    }
+
+    return serviceArea;
+  }
+
+  private cachedCoordinates(value: unknown): [number, number, number, number] | undefined {
+    if (!Array.isArray(value) || value.length !== 4) {
+      return undefined;
+    }
+
+    const coordinates = value.map((entry) => this.toNumber(entry));
+    if (coordinates.some((entry) => entry === undefined)) {
+      return undefined;
+    }
+
+    return coordinates as [number, number, number, number];
+  }
+
+  private normalizeCachedServiceMaps(value: unknown, serviceAreas: ServiceAreaConfig[]): ServiceMapConfig[] {
+    if (!Array.isArray(value)) {
+      return this.serviceMapsFromAreas(serviceAreas);
+    }
+
+    const seenMapIds = new Set<number>();
+    const serviceMaps: ServiceMapConfig[] = [];
+
+    for (const entry of value) {
+      if (!this.isRecord(entry)) {
+        continue;
+      }
+
+      const mapId = this.toInteger(entry.mapId);
+      const name = this.toNonEmptyString(entry.name);
+
+      if (mapId === undefined || !name || seenMapIds.has(mapId)) {
+        continue;
+      }
+
+      seenMapIds.add(mapId);
+      serviceMaps.push({ mapId, name });
+    }
+
+    return serviceMaps.length > 0 ? serviceMaps : this.serviceMapsFromAreas(serviceAreas);
   }
 
   private serviceAreaCachePath(): string {
@@ -1350,7 +1533,7 @@ export class RoborockCloudConnection {
     try {
       await fs.chmod(filePath, PRIVATE_CACHE_FILE_MODE);
     } catch (error) {
-      this.log.debug(`Could not restrict Roborock room cache permissions. ${this.formatError(error)}`);
+      this.log.debug(`Could not restrict Roborock room cache permissions. ${formatRoborockError(error)}`);
     }
   }
 
@@ -1393,16 +1576,21 @@ export class RoborockCloudConnection {
     action: string,
     attempts = 4,
   ): Promise<unknown> {
+    const roborock = this.roborock;
+    if (!roborock) {
+      throw new Error('Roborock cloud client is not available.');
+    }
+
     let lastError: unknown;
 
     for (let attempt = 1; attempt <= attempts; attempt++) {
       try {
-        return await this.roborock!.messageQueueHandler.sendRequest(duid, method, params);
+        return await roborock.messageQueueHandler.sendRequest(duid, method, params);
       } catch (error) {
         lastError = error;
 
         if (attempt < attempts) {
-          this.log.debug(`Could not ${action} on attempt ${attempt}/${attempts}; retrying. ${this.formatError(error)}`);
+          this.log.debug(`Could not ${action} on attempt ${attempt}/${attempts}; retrying. ${formatRoborockError(error)}`);
           await this.delay(3_000);
         }
       }
@@ -1434,33 +1622,6 @@ export class RoborockCloudConnection {
     return new Promise((resolve) => setTimeout(resolve, ms));
   }
 
-  private isCloudAckTimeout(error: unknown, method: string): boolean {
-    const text = error instanceof Error ? error.message : String(error);
-    return text.includes('Cloud request')
-      && text.includes(`method ${method}`)
-      && text.includes('timed out after 10 seconds');
-  }
-
-  private formatError(error: unknown): string {
-    if (error instanceof Error) {
-      return error.message;
-    }
-
-    if (error === undefined) {
-      return 'The Roborock request was rejected without details, usually because MQTT/local transport is unavailable at that moment.';
-    }
-
-    if (typeof error === 'string') {
-      return error;
-    }
-
-    try {
-      return JSON.stringify(error);
-    } catch {
-      return String(error);
-    }
-  }
-
   private toNumber(value: unknown): number | undefined {
     if (typeof value === 'number' && Number.isFinite(value)) {
       return value;
@@ -1472,6 +1633,11 @@ export class RoborockCloudConnection {
     }
 
     return undefined;
+  }
+
+  private toInteger(value: unknown): number | undefined {
+    const number = this.toNumber(value);
+    return number !== undefined && Number.isInteger(number) ? number : undefined;
   }
 
   private resolveModel(device: RoborockCloudDevice): string | null {
@@ -1528,6 +1694,7 @@ export class RoborockCloudConnection {
 export class RoborockCloudVacuumClient implements RoborockVacuumClient {
   private readonly statusListeners = new Set<RoborockStatusListener>();
   private readonly unsubscribeFromDpsUpdates: () => void;
+  private mappedCleanToken = 0;
 
   constructor(
     private readonly roborock: Roborock,
@@ -1547,7 +1714,7 @@ export class RoborockCloudVacuumClient implements RoborockVacuumClient {
       const payload = await this.call(statusRequest.method, statusRequest.params);
       return this.normalizeStatus(payload);
     } catch (error) {
-      if (this.isCloudAckTimeout(error, statusRequest.method)) {
+      if (isCloudAckTimeout(error, statusRequest.method)) {
         throw error;
       }
 
@@ -1562,18 +1729,22 @@ export class RoborockCloudVacuumClient implements RoborockVacuumClient {
   }
 
   public async start(): Promise<void> {
+    this.cancelPendingMappedClean();
     await this.command('app_start', []);
   }
 
   public async pause(): Promise<void> {
+    this.cancelPendingMappedClean();
     await this.command('app_pause', []);
   }
 
   public async stop(): Promise<void> {
+    this.cancelPendingMappedClean();
     await this.command('app_stop', []);
   }
 
   public async dock(): Promise<void> {
+    this.cancelPendingMappedClean();
     await this.command('app_charge', []);
   }
 
@@ -1596,6 +1767,8 @@ export class RoborockCloudVacuumClient implements RoborockVacuumClient {
   }
 
   public async cleanAreas(areas: ServiceAreaConfig[]): Promise<void> {
+    const cleanToken = this.nextMappedCleanToken();
+
     if (areas.length === 0) {
       await this.start();
       return;
@@ -1609,17 +1782,20 @@ export class RoborockCloudVacuumClient implements RoborockVacuumClient {
     }
 
     if (roomAreas.length > 0) {
-      await this.ensureRoborockMapSelected(this.singleMapId(roomAreas));
       const segmentIds = roomAreas.map((area) => area.segmentId ?? area.areaId);
       const repeat = Math.max(...roomAreas.map((area) => area.repeat ?? 1));
       const payload = this.config.segmentCleanPayload ?? 'segmentsObject';
+      const mapId = this.singleMapId(roomAreas);
+      const cleanRooms = async () => {
+        if (payload === 'segmentIds') {
+          await this.command('app_segment_clean', segmentIds);
+          return;
+        }
 
-      if (payload === 'segmentIds') {
-        await this.command('app_segment_clean', segmentIds);
-        return;
-      }
+        await this.command('app_segment_clean', [{ segments: segmentIds, repeat }]);
+      };
 
-      await this.command('app_segment_clean', [{ segments: segmentIds, repeat }]);
+      await this.runMappedClean(mapId, cleanToken, 'room clean', cleanRooms);
       return;
     }
 
@@ -1631,11 +1807,11 @@ export class RoborockCloudVacuumClient implements RoborockVacuumClient {
       return [...area.coordinates, area.repeat ?? 1];
     });
 
-    await this.ensureRoborockMapSelected(this.singleMapId(zoneAreas));
-    await this.command('app_zoned_clean', zones);
+    await this.runMappedClean(this.singleMapId(zoneAreas), cleanToken, 'zone clean', () => this.command('app_zoned_clean', zones));
   }
 
   public destroy(): void {
+    this.cancelPendingMappedClean();
     this.unsubscribeFromDpsUpdates();
     this.statusListeners.clear();
     // The shared cloud connection owns the Roborock service lifecycle.
@@ -1661,7 +1837,7 @@ export class RoborockCloudVacuumClient implements RoborockVacuumClient {
 
     for (const listener of this.statusListeners) {
       Promise.resolve(listener(status)).catch((error) => {
-        this.log.warn(`Failed to apply Roborock push status update for ${this.config.name}: ${this.formatError(error)}`);
+        this.log.warn(`Failed to apply Roborock push status update for ${this.config.name}: ${formatRoborockError(error)}`);
       });
     }
   }
@@ -1691,7 +1867,7 @@ export class RoborockCloudVacuumClient implements RoborockVacuumClient {
         }),
       ]);
     } catch (error) {
-      if (this.isCloudAckTimeout(error, method)) {
+      if (isCloudAckTimeout(error, method)) {
         this.log.warn(`Roborock command "${method}" for ${this.config.name} timed out waiting for a cloud acknowledgement; treating it as sent.`);
         return;
       }
@@ -1705,8 +1881,8 @@ export class RoborockCloudVacuumClient implements RoborockVacuumClient {
 
     if (returnedEarly) {
       response.catch((error) => {
-        if (!this.isCloudAckTimeout(error, method)) {
-          this.log.warn(`Roborock command "${method}" for ${this.config.name} eventually failed after Matter already returned. ${this.formatError(error)}`);
+        if (!isCloudAckTimeout(error, method)) {
+          this.log.warn(`Roborock command "${method}" for ${this.config.name} eventually failed after Matter already returned. ${formatRoborockError(error)}`);
         }
       });
       this.log.debug(`Roborock command "${method}" for ${this.config.name} was sent but not acknowledged within 2 seconds; returning early so Apple Home stays responsive.`);
@@ -1715,7 +1891,7 @@ export class RoborockCloudVacuumClient implements RoborockVacuumClient {
 
   private singleMapId(areas: ServiceAreaConfig[]): number | undefined {
     const mapIds = new Set(areas
-      .map((area) => area.roborockMapId)
+      .map((area) => area.roborockMapId ?? area.mapId)
       .filter((mapId): mapId is number => typeof mapId === 'number'));
 
     if (mapIds.size > 1) {
@@ -1725,22 +1901,146 @@ export class RoborockCloudVacuumClient implements RoborockVacuumClient {
     return [...mapIds][0];
   }
 
-  private async ensureRoborockMapSelected(mapId?: number): Promise<void> {
+  private nextMappedCleanToken(): number {
+    this.mappedCleanToken++;
+    return this.mappedCleanToken;
+  }
+
+  private cancelPendingMappedClean(): void {
+    this.mappedCleanToken++;
+  }
+
+  private isMappedCleanCurrent(token: number): boolean {
+    return token === this.mappedCleanToken;
+  }
+
+  private async runMappedClean(
+    mapId: number | undefined,
+    token: number,
+    action: string,
+    clean: () => Promise<void>,
+  ): Promise<void> {
     if (mapId === undefined) {
+      await clean();
       return;
     }
 
-    try {
-      const status = await this.getStatus();
-      if (status.mapId === mapId) {
-        return;
-      }
-    } catch (error) {
-      this.log.debug(`Could not confirm current Roborock map for ${this.config.name}; loading selected map anyway. ${this.formatError(error)}`);
+    const currentMapId = await this.currentMapIdForCommand();
+    if (currentMapId === mapId) {
+      await clean();
+      return;
     }
 
-    await this.command('load_multi_map', [mapId]);
-    await this.delay(MAP_DISCOVERY_SETTLE_MS);
+    this.log.info(
+      `Roborock ${action} for ${this.config.name} needs map ${mapId}; `
+      + 'switching maps in the background and waiting for confirmation before sending the clean command.',
+    );
+    void this.switchMapThenRunClean(mapId, token, action, clean).catch((error) => {
+      this.log.warn(`Roborock ${action} for ${this.config.name} failed after Matter already returned. ${formatRoborockError(error)}`);
+    });
+  }
+
+  private async currentMapIdForCommand(): Promise<number | undefined> {
+    let timeout: NodeJS.Timeout | undefined;
+    const statusRequest = this.getStatus()
+      .then((status) => status.mapId)
+      .catch((error) => {
+        this.log.debug(`Could not read current Roborock map for ${this.config.name} before a map-specific clean. ${formatRoborockError(error)}`);
+        return undefined;
+      });
+
+    try {
+      return await Promise.race([
+        statusRequest,
+        new Promise<undefined>((resolve) => {
+          timeout = setTimeout(() => resolve(undefined), COMMAND_MAP_STATUS_TIMEOUT_MS);
+        }),
+      ]);
+    } finally {
+      if (timeout) {
+        clearTimeout(timeout);
+      }
+    }
+  }
+
+  private async switchMapThenRunClean(
+    mapId: number,
+    token: number,
+    action: string,
+    clean: () => Promise<void>,
+  ): Promise<void> {
+    const switched = await this.switchRoborockMapForCommand(mapId, action);
+    if (!switched) {
+      return;
+    }
+
+    if (!this.isMappedCleanCurrent(token)) {
+      this.log.debug(`Skipping Roborock ${action} for ${this.config.name} because a newer command superseded it.`);
+      return;
+    }
+
+    await clean();
+  }
+
+  private async switchRoborockMapForCommand(mapId: number, action: string): Promise<boolean> {
+    try {
+      await this.command('load_multi_map', [mapId]);
+    } catch (error) {
+      if (!isCloudAckTimeout(error, 'load_multi_map')) {
+        throw error;
+      }
+
+      this.log.warn(`Roborock map switch to ${mapId} for ${this.config.name} timed out waiting for a cloud acknowledgement; waiting for map confirmation before ${action}.`);
+    }
+
+    const confirmation = await this.waitForRoborockMapForCommand(mapId);
+    if (confirmation === 'confirmed') {
+      await this.delay(MAP_DISCOVERY_SETTLE_MS);
+      return true;
+    }
+
+    this.log.warn(
+      `Roborock did not confirm map ${mapId} for ${this.config.name}; `
+      + `not sending ${action} to avoid cleaning rooms on the wrong map.`,
+    );
+    return false;
+  }
+
+  private async waitForRoborockMapForCommand(mapId: number): Promise<'confirmed' | 'mismatch' | 'unknown'> {
+    const startedAt = Date.now();
+    let sawMapStatus = false;
+    let lastMapId: number | undefined;
+
+    while (Date.now() - startedAt < MAP_DISCOVERY_CONFIRM_TIMEOUT_MS) {
+      await this.delay(MAP_DISCOVERY_CONFIRM_INTERVAL_MS);
+
+      let status: RoborockStatus;
+      try {
+        status = await this.getStatus();
+      } catch (error) {
+        this.log.debug(`Could not confirm Roborock map ${mapId} for ${this.config.name}; retrying. ${formatRoborockError(error)}`);
+        continue;
+      }
+
+      if (status.mapId === undefined) {
+        continue;
+      }
+
+      sawMapStatus = true;
+      lastMapId = status.mapId;
+
+      if (status.mapId === mapId) {
+        return 'confirmed';
+      }
+    }
+
+    if (sawMapStatus) {
+      this.log.debug(`Roborock ${this.config.name} last reported map ${lastMapId} while waiting for map ${mapId}.`);
+      return 'mismatch';
+    }
+
+    this.log.debug(`Roborock ${this.config.name} did not report a current map while waiting for map ${mapId}.`);
+    return 'unknown';
   }
 
   private delay(ms: number): Promise<void> {
@@ -1771,33 +2071,6 @@ export class RoborockCloudVacuumClient implements RoborockVacuumClient {
       fallbackMethod: 'get_prop',
       fallbackParams: ['get_status'],
     };
-  }
-
-  private isCloudAckTimeout(error: unknown, method: string): boolean {
-    const text = error instanceof Error ? error.message : String(error);
-    return text.includes('Cloud request')
-      && text.includes(`method ${method}`)
-      && text.includes('timed out after 10 seconds');
-  }
-
-  private formatError(error: unknown): string {
-    if (error instanceof Error) {
-      return error.message;
-    }
-
-    if (error === undefined) {
-      return 'The Roborock request was rejected without details.';
-    }
-
-    if (typeof error === 'string') {
-      return error;
-    }
-
-    try {
-      return JSON.stringify(error);
-    } catch {
-      return String(error);
-    }
   }
 
   private normalizeStatus(payload: unknown): RoborockStatus {
@@ -1836,7 +2109,7 @@ export class RoborockCloudVacuumClient implements RoborockVacuumClient {
   private compactStatus(status: RoborockStatus): RoborockStatus {
     return Object.fromEntries(
       Object.entries(status).filter(([, value]) => value !== undefined),
-    ) as RoborockStatus;
+    );
   }
 
   private hasStatusValues(status: RoborockStatus): boolean {

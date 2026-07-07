@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## 0.6.0 - 2026-07-06
+
+- Made Roborock room discovery cache-first with a 24-hour default TTL, avoiding live saved-map switching on normal Homebridge restarts while retaining manual `forceRoomRediscovery` and `roomDiscoveryCacheTtlHours` JSON overrides.
+- Wait for Roborock to confirm a requested map switch before sending map-specific room or zone clean commands, avoiding accidental cleaning on the previously active saved map.
+- Centralized Roborock cloud timeout classification and error formatting so command acknowledgement timeouts no longer depend on parsing human-readable log text.
+- Added Vitest unit coverage for Matter state mapping, config/cache validation, Roborock timeout classification, and map-specific room-clean command ordering, plus ESLint/typecheck coverage in a GitHub Actions CI workflow.
+
 ## 0.5.1 - 2026-06-25
 
 - Built Matter vacuum accessories once after the initial status read, avoiding duplicate clean-mode startup logging and unnecessary accessory reconstruction.

@@ -20,11 +20,16 @@ type LegacyLocalVacuumConfig = RoborockVacuumConfig & {
   token?: string;
 };
 
+const REGISTRATION_RETRY_DELAYS_MS = [30_000, 60_000, 5 * 60_000, 15 * 60_000] as const;
+
 export class RoborockMatterPlatform implements DynamicPlatformPlugin {
   private readonly config: RoborockMatterConfig;
   private readonly cachedMatterAccessories = new Map<string, MatterAccessory>();
   private readonly vacuums = new Map<string, RoborockMatterVacuum>();
   private cloudConnection?: RoborockCloudConnection;
+  private registrationRetryTimer?: NodeJS.Timeout;
+  private registrationRetryAttempt = 0;
+  private shutdownRequested = false;
 
   constructor(
     private readonly log: Logger,
@@ -33,13 +38,11 @@ export class RoborockMatterPlatform implements DynamicPlatformPlugin {
   ) {
     this.config = config as RoborockMatterConfig;
 
-    this.api.on(APIEvent.DID_FINISH_LAUNCHING, () => {
-      void this.registerMatterVacuums().catch((error) => {
-        this.log.error(`Failed to register Matter Roborock vacuums: ${String(error)}`);
-      });
-    });
+    this.api.on(APIEvent.DID_FINISH_LAUNCHING, () => this.scheduleRegistrationAttempt(0));
 
     this.api.on(APIEvent.SHUTDOWN, () => {
+      this.shutdownRequested = true;
+      this.clearRegistrationRetry();
       for (const vacuum of this.vacuums.values()) {
         vacuum.destroy();
       }
@@ -53,6 +56,45 @@ export class RoborockMatterPlatform implements DynamicPlatformPlugin {
 
   public configureMatterAccessory(accessory: MatterAccessory): void {
     this.cachedMatterAccessories.set(accessory.UUID, accessory);
+  }
+
+  private scheduleRegistrationAttempt(delayMs: number): void {
+    this.clearRegistrationRetry();
+    this.registrationRetryTimer = setTimeout(() => {
+      this.registrationRetryTimer = undefined;
+      void this.tryRegisterMatterVacuums();
+    }, delayMs);
+    this.registrationRetryTimer.unref();
+  }
+
+  private clearRegistrationRetry(): void {
+    if (this.registrationRetryTimer) {
+      clearTimeout(this.registrationRetryTimer);
+      this.registrationRetryTimer = undefined;
+    }
+  }
+
+  private async tryRegisterMatterVacuums(): Promise<void> {
+    if (this.shutdownRequested) {
+      return;
+    }
+
+    try {
+      await this.registerMatterVacuums();
+      this.registrationRetryAttempt = 0;
+    } catch (error) {
+      const delayMs = REGISTRATION_RETRY_DELAYS_MS[Math.min(this.registrationRetryAttempt, REGISTRATION_RETRY_DELAYS_MS.length - 1)];
+      this.registrationRetryAttempt++;
+
+      if (this.registrationRetryAttempt === 1) {
+        this.log.error(`Failed to register Matter Roborock vacuums: ${String(error)}`);
+      } else {
+        this.log.warn(`Roborock Matter registration still failing: ${String(error)}`);
+      }
+
+      this.log.info(`Retrying Roborock Matter registration in ${Math.round(delayMs / 1000)} seconds.`);
+      this.scheduleRegistrationAttempt(delayMs);
+    }
   }
 
   private async registerMatterVacuums(): Promise<void> {
@@ -75,6 +117,9 @@ export class RoborockMatterPlatform implements DynamicPlatformPlugin {
 
     if (vacuumRegistrations.length === 0) {
       this.log.warn('No Roborock vacuums found. Configure a Roborock account with at least one supported vacuum.');
+      if (this.cloudConnection?.isStarted()) {
+        await this.removeStaleMatterAccessories(new Set());
+      }
       return;
     }
 
@@ -83,6 +128,9 @@ export class RoborockMatterPlatform implements DynamicPlatformPlugin {
     for (const { config: vacuumConfig, client } of vacuumRegistrations) {
       const vacuum = new RoborockMatterVacuum(this.api, this.log, this.config, vacuumConfig, client);
       expectedUuids.add(vacuum.UUID);
+      const cachedAccessory = this.cachedMatterAccessories.get(vacuum.UUID);
+      const cachedContext = (cachedAccessory as unknown as { context?: Record<string, unknown> } | undefined)?.context;
+      vacuum.restoreSelectedAreaIds(cachedContext?.selectedAreaIds);
 
       let initialStatus: RoborockStatus | undefined;
 
@@ -94,7 +142,7 @@ export class RoborockMatterPlatform implements DynamicPlatformPlugin {
 
       const accessory = vacuum.buildAccessory(initialStatus);
 
-      if (this.cachedMatterAccessories.has(vacuum.UUID)) {
+      if (cachedAccessory) {
         await this.api.matter.updatePlatformAccessories([accessory]);
         this.log.info(`Updated Matter Roborock vacuum: ${vacuumConfig.name}`);
       } else {
@@ -104,6 +152,14 @@ export class RoborockMatterPlatform implements DynamicPlatformPlugin {
 
       vacuum.startPolling();
       this.vacuums.set(vacuum.UUID, vacuum);
+    }
+
+    await this.removeStaleMatterAccessories(expectedUuids);
+  }
+
+  private async removeStaleMatterAccessories(expectedUuids: Set<string>): Promise<void> {
+    if (!this.api.matter) {
+      return;
     }
 
     const staleAccessories = [...this.cachedMatterAccessories.values()].filter((accessory) => {
@@ -131,6 +187,9 @@ export class RoborockMatterPlatform implements DynamicPlatformPlugin {
     this.warnAboutUnsupportedLocalConfig();
 
     if (this.config.username) {
+      await this.cloudConnection?.destroy().catch((error) => {
+        this.log.debug(`Could not stop previous Roborock cloud connection before retrying registration: ${String(error)}`);
+      });
       this.cloudConnection = new RoborockCloudConnection(
         this.config,
         this.log,

@@ -6,6 +6,9 @@ npm-debug.log*
 # Local package builds
 *.tgz
 
+# Local review/handoff notes
+docs/claude-*.md
+
 # Local environment and secrets
 .env
 .env.*

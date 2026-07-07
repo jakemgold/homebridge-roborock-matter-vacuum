@@ -1,6 +1,6 @@
 {
   "name": "homebridge-roborock-matter-vacuum",
-  "version": "0.5.1",
+  "version": "0.6.0",
   "description": "Homebridge 2.0 Matter robotic vacuum plugin for Roborock cloud vacuums.",
   "displayName": "Homebridge Roborock Matter Vacuum",
   "author": "Jake Goldman <1660744+jakemgold@users.noreply.github.com>",
@@ -44,7 +44,10 @@
   },
   "scripts": {
     "build": "tsc",
-    "lint": "tsc --noEmit",
+    "lint": "eslint \"src/**/*.ts\" \"test/**/*.ts\" vitest.config.ts",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest",
     "audit:prod": "npm audit --omit=dev",
     "watch": "tsc --watch",
     "prepack": "npm run build"
@@ -55,9 +58,13 @@
     "mqtt": "5.15.1"
   },
   "devDependencies": {
+    "@eslint/js": "^10.0.1",
     "@types/node": "^22.15.29",
+    "eslint": "^10.6.0",
     "homebridge": "^2.0.2",
-    "typescript": "^5.8.3"
+    "typescript": "^5.8.3",
+    "typescript-eslint": "^8.63.0",
+    "vitest": "^4.1.10"
   },
   "homebridge": {
     "pluginAlias": "RoborockMatter",
