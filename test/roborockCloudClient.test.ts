@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { RoborockCloudConnection, RoborockCloudVacuumClient } from '../src/roborockCloudClient';
+import { RoborockRequestTimeoutError } from '../src/roborockErrors';
 import { PLATFORM_NAME, type RoborockMatterConfig, type ServiceAreaConfig } from '../src/settings';
 
 function log() {
@@ -76,6 +77,23 @@ describe('RoborockCloudConnection room cache', () => {
       updatedAt: '2026-07-06T10:00:00.000Z',
     });
   });
+
+  it('does not include a secret-bearing custom host value in validation errors', () => {
+    expect(() => {
+      connection({
+        baseUrl: 'https://user:super-secret@example.com/?token=also-secret',
+      }).resolveBaseUrl();
+    }).toThrow('Unsupported Roborock API host');
+
+    try {
+      connection({
+        baseUrl: 'https://user:super-secret@example.com/?token=also-secret',
+      }).resolveBaseUrl();
+    } catch (error) {
+      expect(String(error)).not.toContain('super-secret');
+      expect(String(error)).not.toContain('also-secret');
+    }
+  });
 });
 
 describe('RoborockCloudVacuumClient map-specific cleaning', () => {
@@ -140,13 +158,37 @@ describe('RoborockCloudVacuumClient map-specific cleaning', () => {
     expect(calls.map((call) => call.method)).toContain('load_multi_map');
     expect(calls.map((call) => call.method)).not.toContain('app_segment_clean');
   });
+
+  it('reconnects MQTT after three consecutive status acknowledgement timeouts', async () => {
+    const recoverMqttConnection = vi.fn(async () => undefined);
+    let attempts = 0;
+    const client = vacuumClient(async (_duid, method) => {
+      attempts++;
+      if (attempts === 4) {
+        return [{ state: 3, battery: 100 }];
+      }
+      throw new RoborockRequestTimeoutError(42, method, true, 10_000);
+    }, recoverMqttConnection);
+
+    await expect(client.getStatus()).rejects.toBeInstanceOf(RoborockRequestTimeoutError);
+    await expect(client.getStatus()).rejects.toBeInstanceOf(RoborockRequestTimeoutError);
+    expect(recoverMqttConnection).not.toHaveBeenCalled();
+
+    await expect(client.getStatus()).resolves.toMatchObject({ state: 3, battery: 100 });
+    expect(recoverMqttConnection).toHaveBeenCalledTimes(1);
+    expect(attempts).toBe(4);
+  });
 });
 
-function vacuumClient(sendRequest: (duid: string, method: string, params: unknown[]) => Promise<unknown>): RoborockCloudVacuumClient {
+function vacuumClient(
+  sendRequest: (duid: string, method: string, params: unknown[]) => Promise<unknown>,
+  recoverMqttConnection = vi.fn(async () => undefined),
+): RoborockCloudVacuumClient {
   return new RoborockCloudVacuumClient(
     {
       onDpsUpdate: vi.fn(() => vi.fn()),
       getRobotVersion: vi.fn(() => '1.0'),
+      recoverMqttConnection,
       messageQueueHandler: {
         sendRequest,
       },

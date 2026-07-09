@@ -2,6 +2,16 @@
 
 All notable changes to this project will be documented in this file.
 
+## 0.7.0 - 2026-07-09
+
+- Added automatic Roborock MQTT reconnection after repeated status acknowledgement timeouts, allowing polling to recover from sessions that still appeared connected but stopped returning responses.
+- Validated Matter run modes before sending Roborock commands and made invalid cross-map room selections fail without changing or starting the vacuum.
+- Fixed Matter `skipArea` handling so it removes only the requested room instead of clearing every selected room.
+- Made Matter registration retries clean up staged vacuum clients, avoid duplicate publication after partial failures, and start polling only after the full registration pass succeeds.
+- Added finite Roborock HTTP timeouts, cancellation during shutdown/retry, and single-flight home-data refreshes to prevent orphaned or overlapping cloud requests.
+- Sanitized custom API host validation errors so malformed manual configuration cannot echo credentials or query secrets into Homebridge logs.
+- Expanded regression coverage for MQTT recovery, command validation, ServiceArea behavior, secret redaction, and partial registration failures.
+
 ## 0.6.0 - 2026-07-06
 
 - Made Roborock room discovery cache-first with a 24-hour default TTL, avoiding live saved-map switching on normal Homebridge restarts while retaining manual `forceRoomRediscovery` and `roomDiscoveryCacheTtlHours` JSON overrides.

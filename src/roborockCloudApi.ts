@@ -142,6 +142,8 @@ const API_V4_LOGIN_PASSWORD = 'api/v4/auth/email/login/pwd';
 const API_V4_EMAIL_CODE = 'api/v4/email/code/send';
 const DEFAULT_BASE_URL = 'usiot.roborock.com';
 const ROBOROCK_APP_VERSION = '4.54.02';
+const HTTP_REQUEST_TIMEOUT_MS = 20_000;
+const MQTT_RECOVERY_TIMEOUT_MS = 15_000;
 const REQUEST_TIMEOUT_MS = 10_000;
 const PERSISTED_STATE_IDS = new Set(['UserData', 'clientID', 'HomeData']);
 const PRIVATE_DIRECTORY_MODE = 0o700;
@@ -184,6 +186,9 @@ export class RoborockCloudApi {
   private localKeys = new Map<string, string>();
   private requestId = 0;
   private homeDataRefreshInterval?: NodeJS.Timeout;
+  private homeDataRefreshInFlight?: Promise<void>;
+  private mqttRecoveryInFlight?: Promise<void>;
+  private requestAbortController = new AbortController();
 
   constructor(options: RoborockOptions) {
     this.config = options;
@@ -217,6 +222,10 @@ export class RoborockCloudApi {
 
     this.log.info('Starting Roborock cloud client.');
 
+    if (this.requestAbortController.signal.aborted) {
+      this.requestAbortController = new AbortController();
+    }
+
     const clientID = this.getOrCreateClientId();
 
     if (!this.config.username) {
@@ -230,6 +239,7 @@ export class RoborockCloudApi {
       username: this.config.username,
       clientID,
       language: this.language,
+      signal: this.requestAbortController.signal,
     });
 
     let userData = await this.getUserData();
@@ -273,6 +283,8 @@ export class RoborockCloudApi {
       this.homeDataRefreshInterval = undefined;
     }
 
+    this.requestAbortController.abort();
+
     for (const [requestId, request] of this.pendingRequests) {
       clearTimeout(request.timeout);
       request.reject(new Error('Roborock cloud client stopped before the request completed.'));
@@ -280,6 +292,8 @@ export class RoborockCloudApi {
     }
 
     await this.rr_mqtt_connector.disconnect();
+    this.loginApi = undefined;
+    this.api = undefined;
     this.bInited = false;
   }
 
@@ -306,6 +320,27 @@ export class RoborockCloudApi {
     }
 
     await this.refreshHomeData(this.userData);
+  }
+
+  public async recoverMqttConnection(): Promise<void> {
+    if (!this.userData) {
+      throw new Error('Roborock user data is not available for MQTT recovery.');
+    }
+
+    if (this.mqttRecoveryInFlight) {
+      return this.mqttRecoveryInFlight;
+    }
+
+    const recovery = this.rr_mqtt_connector.reconnect(this.userData, MQTT_RECOVERY_TIMEOUT_MS);
+    this.mqttRecoveryInFlight = recovery;
+
+    try {
+      await recovery;
+    } finally {
+      if (this.mqttRecoveryInFlight === recovery) {
+        this.mqttRecoveryInFlight = undefined;
+      }
+    }
   }
 
   public onDpsUpdate(listener: RoborockDpsListener): () => void {
@@ -536,7 +571,11 @@ export class RoborockCloudApi {
   }
 
   private createCloudApi(rriot: RoborockRriot): AxiosInstance {
-    const api = axios.create({ baseURL: rriot.r.a });
+    const api = axios.create({
+      baseURL: rriot.r.a,
+      signal: this.requestAbortController.signal,
+      timeout: HTTP_REQUEST_TIMEOUT_MS,
+    });
 
     api.interceptors.request.use((config) => {
       this.applyHawkAuthorization(config, api, rriot);
@@ -571,6 +610,23 @@ export class RoborockCloudApi {
   }
 
   private async refreshHomeData(userData: RoborockUserData): Promise<void> {
+    if (this.homeDataRefreshInFlight) {
+      return this.homeDataRefreshInFlight;
+    }
+
+    const refresh = this.performHomeDataRefresh(userData);
+    this.homeDataRefreshInFlight = refresh;
+
+    try {
+      await refresh;
+    } finally {
+      if (this.homeDataRefreshInFlight === refresh) {
+        this.homeDataRefreshInFlight = undefined;
+      }
+    }
+  }
+
+  private async performHomeDataRefresh(userData: RoborockUserData): Promise<void> {
     if (!this.loginApi || !this.api) {
       throw new Error('Roborock APIs are not initialized.');
     }
@@ -949,6 +1005,21 @@ class RoborockMqttConnector {
     });
   }
 
+  public async reconnect(userData: RoborockUserData, timeoutMs: number): Promise<void> {
+    await this.connect(userData);
+
+    const startedAt = Date.now();
+    while (Date.now() - startedAt < timeoutMs) {
+      if (this.connected) {
+        return;
+      }
+
+      await new Promise((resolve) => setTimeout(resolve, 250));
+    }
+
+    throw new Error(`Roborock MQTT reconnection timed out after ${Math.round(timeoutMs / 1000)} seconds.`);
+  }
+
   public async disconnect(): Promise<void> {
     const client = this.client;
     this.client = undefined;
@@ -1273,9 +1344,17 @@ class RoborockMessageCodec {
   }
 }
 
-function createLoginApi(options: { baseURL: string; username: string; clientID: string; language: string }): AxiosInstance {
+function createLoginApi(options: {
+  baseURL: string;
+  username: string;
+  clientID: string;
+  language: string;
+  signal: AbortSignal;
+}): AxiosInstance {
   return axios.create({
     baseURL: `https://${normalizeBaseURL(options.baseURL)}`,
+    signal: options.signal,
+    timeout: HTTP_REQUEST_TIMEOUT_MS,
     headers: {
       header_clientid: crypto.createHash('md5').update(options.username).update(options.clientID).digest().toString('base64'),
       header_clientlang: options.language,

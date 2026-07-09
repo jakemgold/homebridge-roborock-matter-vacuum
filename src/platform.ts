@@ -43,10 +43,8 @@ export class RoborockMatterPlatform implements DynamicPlatformPlugin {
     this.api.on(APIEvent.SHUTDOWN, () => {
       this.shutdownRequested = true;
       this.clearRegistrationRetry();
-      for (const vacuum of this.vacuums.values()) {
-        vacuum.destroy();
-      }
-      void this.cloudConnection?.destroy();
+      this.destroyVacuums(this.vacuums);
+      void this.destroyCloudConnection();
     });
   }
 
@@ -83,6 +81,12 @@ export class RoborockMatterPlatform implements DynamicPlatformPlugin {
       await this.registerMatterVacuums();
       this.registrationRetryAttempt = 0;
     } catch (error) {
+      await this.destroyCloudConnection();
+
+      if (this.shutdownRequested) {
+        return;
+      }
+
       const delayMs = REGISTRATION_RETRY_DELAYS_MS[Math.min(this.registrationRetryAttempt, REGISTRATION_RETRY_DELAYS_MS.length - 1)];
       this.registrationRetryAttempt++;
 
@@ -124,37 +128,71 @@ export class RoborockMatterPlatform implements DynamicPlatformPlugin {
     }
 
     const expectedUuids = new Set<string>();
+    const nextVacuums = new Map<string, RoborockMatterVacuum>();
 
-    for (const { config: vacuumConfig, client } of vacuumRegistrations) {
-      const vacuum = new RoborockMatterVacuum(this.api, this.log, this.config, vacuumConfig, client);
-      expectedUuids.add(vacuum.UUID);
-      const cachedAccessory = this.cachedMatterAccessories.get(vacuum.UUID);
-      const cachedContext = (cachedAccessory as unknown as { context?: Record<string, unknown> } | undefined)?.context;
-      vacuum.restoreSelectedAreaIds(cachedContext?.selectedAreaIds);
+    try {
+      for (const { config: vacuumConfig, client } of vacuumRegistrations) {
+        if (this.shutdownRequested) {
+          throw new Error('Homebridge shutdown interrupted Roborock Matter registration.');
+        }
 
-      let initialStatus: RoborockStatus | undefined;
+        const vacuum = new RoborockMatterVacuum(this.api, this.log, this.config, vacuumConfig, client);
+        if (nextVacuums.has(vacuum.UUID)) {
+          vacuum.destroy();
+          this.log.warn(`Ignoring duplicate Roborock vacuum registration for ${vacuumConfig.name}.`);
+          continue;
+        }
 
-      try {
-        initialStatus = await client.getStatus();
-      } catch (error) {
-        this.log.warn(`Could not read initial state for ${vacuumConfig.name}; publishing with default stopped state. ${String(error)}`);
+        nextVacuums.set(vacuum.UUID, vacuum);
+        expectedUuids.add(vacuum.UUID);
+        const cachedAccessory = this.cachedMatterAccessories.get(vacuum.UUID);
+        const cachedContext = (cachedAccessory as unknown as { context?: Record<string, unknown> } | undefined)?.context;
+        vacuum.restoreSelectedAreaIds(cachedContext?.selectedAreaIds);
+
+        let initialStatus: RoborockStatus | undefined;
+
+        try {
+          initialStatus = await client.getStatus();
+        } catch (error) {
+          this.log.warn(`Could not read initial state for ${vacuumConfig.name}; publishing with default stopped state. ${String(error)}`);
+        }
+
+        if (this.shutdownRequested) {
+          throw new Error('Homebridge shutdown interrupted Roborock Matter registration.');
+        }
+
+        const accessory = vacuum.buildAccessory(initialStatus);
+
+        if (cachedAccessory) {
+          await this.api.matter.updatePlatformAccessories([accessory]);
+          this.log.info(`Updated Matter Roborock vacuum: ${vacuumConfig.name}`);
+        } else {
+          await this.api.matter.registerPlatformAccessories(PLUGIN_NAME, PLATFORM_NAME, [accessory]);
+          this.log.info(`Registered Matter Roborock vacuum: ${vacuumConfig.name}`);
+        }
+
+        this.cachedMatterAccessories.set(vacuum.UUID, accessory);
       }
 
-      const accessory = vacuum.buildAccessory(initialStatus);
+      await this.removeStaleMatterAccessories(expectedUuids);
 
-      if (cachedAccessory) {
-        await this.api.matter.updatePlatformAccessories([accessory]);
-        this.log.info(`Updated Matter Roborock vacuum: ${vacuumConfig.name}`);
-      } else {
-        await this.api.matter.registerPlatformAccessories(PLUGIN_NAME, PLATFORM_NAME, [accessory]);
-        this.log.info(`Registered Matter Roborock vacuum: ${vacuumConfig.name}`);
+      if (this.shutdownRequested) {
+        throw new Error('Homebridge shutdown interrupted Roborock Matter registration.');
       }
 
-      vacuum.startPolling();
-      this.vacuums.set(vacuum.UUID, vacuum);
+      for (const vacuum of nextVacuums.values()) {
+        vacuum.startPolling();
+      }
+
+      this.destroyVacuums(this.vacuums);
+      for (const [uuid, vacuum] of nextVacuums) {
+        this.vacuums.set(uuid, vacuum);
+      }
+      nextVacuums.clear();
+    } catch (error) {
+      this.destroyVacuums(nextVacuums);
+      throw error;
     }
-
-    await this.removeStaleMatterAccessories(expectedUuids);
   }
 
   private async removeStaleMatterAccessories(expectedUuids: Set<string>): Promise<void> {
@@ -187,9 +225,8 @@ export class RoborockMatterPlatform implements DynamicPlatformPlugin {
     this.warnAboutUnsupportedLocalConfig();
 
     if (this.config.username) {
-      await this.cloudConnection?.destroy().catch((error) => {
-        this.log.debug(`Could not stop previous Roborock cloud connection before retrying registration: ${String(error)}`);
-      });
+      this.destroyVacuums(this.vacuums);
+      await this.destroyCloudConnection();
       this.cloudConnection = new RoborockCloudConnection(
         this.config,
         this.log,
@@ -201,6 +238,26 @@ export class RoborockMatterPlatform implements DynamicPlatformPlugin {
     }
 
     return registrations;
+  }
+
+  private destroyVacuums(vacuums: Map<string, RoborockMatterVacuum>): void {
+    for (const vacuum of vacuums.values()) {
+      vacuum.destroy();
+    }
+    vacuums.clear();
+  }
+
+  private async destroyCloudConnection(): Promise<void> {
+    const cloudConnection = this.cloudConnection;
+    this.cloudConnection = undefined;
+
+    if (!cloudConnection) {
+      return;
+    }
+
+    await cloudConnection.destroy().catch((error) => {
+      this.log.debug(`Could not stop the previous Roborock cloud connection: ${String(error)}`);
+    });
   }
 
   private warnAboutUnsupportedLocalConfig(): void {

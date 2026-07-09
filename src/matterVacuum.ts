@@ -99,16 +99,6 @@ const BATTERY_CHARGE_STATE = {
   IsNotCharging: 3,
 } as const;
 
-const SERVICE_AREA_SELECT_STATUS = {
-  Success: 0,
-  UnsupportedArea: 1,
-  InvalidSet: 3,
-} as const;
-
-const SERVICE_AREA_SKIP_STATUS = {
-  Success: 0,
-} as const;
-
 const MIN_POLLING_INTERVAL_SECONDS = 60;
 const REFRESH_WARNING_THROTTLE_MS = 10 * 60 * 1000;
 const MAX_REFRESH_BACKOFF_MS = 5 * 60 * 1000;
@@ -346,6 +336,10 @@ export class RoborockMatterVacuum {
   }
 
   private async changeRunMode(newMode: number): Promise<void> {
+    if (newMode !== 0 && newMode !== 1) {
+      throw new Error(`Unsupported run mode: ${newMode}`);
+    }
+
     await this.withMatterError('change run mode', async () => {
       if (newMode === 0) {
         await this.client.pause();
@@ -968,37 +962,26 @@ export class RoborockMatterVacuum {
           });
 
           if (unknownAreas.length > 0) {
-            return {
-              status: SERVICE_AREA_SELECT_STATUS.UnsupportedArea,
-              statusText: `Unknown service area(s): ${unknownAreas.join(', ')}`,
-            };
+            return;
           }
 
           const selectedAreaConfigs = this.serviceAreas.filter((area) => selectedAreas.includes(area.areaId));
           const selectedMapIds = new Set(selectedAreaConfigs.map((area) => this.areaMapId(area)));
 
           if (selectedMapIds.size > 1) {
-            return {
-              status: SERVICE_AREA_SELECT_STATUS.InvalidSet,
-              statusText: 'Select rooms from one Roborock map at a time.',
-            };
+            throw new Error('Select rooms from one Roborock map at a time.');
           }
 
           this.selectedAreaIds = selectedAreas;
           await this.updateSelectedAreas();
-
-          return {
-            status: SERVICE_AREA_SELECT_STATUS.Success,
-            statusText: '',
-          };
         },
-        skipArea: async () => {
-          this.selectedAreaIds = [];
+        skipArea: async (request: { skippedArea?: number }) => {
+          if (request.skippedArea === undefined || !this.selectedAreaIds.includes(request.skippedArea)) {
+            return;
+          }
+
+          this.selectedAreaIds = this.selectedAreaIds.filter((areaId) => areaId !== request.skippedArea);
           await this.updateSelectedAreas();
-          return {
-            status: SERVICE_AREA_SKIP_STATUS.Success,
-            statusText: '',
-          };
         },
       },
     };

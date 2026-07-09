@@ -13,20 +13,30 @@ const BATTERY_CHARGE_STATE = {
   IsAtFullCharge: 2,
 } as const;
 
-function createVacuum(config: Partial<RoborockVacuumConfig> = {}): RoborockMatterVacuum {
-  return new RoborockMatterVacuum(
-    {
-      matter: {
-        deviceTypes: {
-          RoboticVacuumCleaner: 0x74,
-        },
-        uuid: {
-          generate: (value: string) => `uuid:${value}`,
-        },
-        updateAccessoryState: vi.fn(),
-        updatePlatformAccessories: vi.fn(),
-      },
-    } as any,
+function createVacuumFixture(config: Partial<RoborockVacuumConfig> = {}) {
+  const matter = {
+    deviceTypes: {
+      RoboticVacuumCleaner: 0x74,
+    },
+    uuid: {
+      generate: (value: string) => `uuid:${value}`,
+    },
+    updateAccessoryState: vi.fn(async () => undefined),
+    updatePlatformAccessories: vi.fn(async () => undefined),
+  };
+  const client = {
+    getStatus: vi.fn(),
+    start: vi.fn(),
+    pause: vi.fn(),
+    stop: vi.fn(),
+    dock: vi.fn(),
+    locate: vi.fn(),
+    setCleanMode: vi.fn(),
+    cleanAreas: vi.fn(),
+    destroy: vi.fn(),
+  };
+  const vacuum = new RoborockMatterVacuum(
+    { matter } as any,
     {
       debug: vi.fn(),
       info: vi.fn(),
@@ -41,18 +51,14 @@ function createVacuum(config: Partial<RoborockVacuumConfig> = {}): RoborockMatte
       duid: 'test-duid',
       ...config,
     },
-    {
-      getStatus: vi.fn(),
-      start: vi.fn(),
-      pause: vi.fn(),
-      stop: vi.fn(),
-      dock: vi.fn(),
-      locate: vi.fn(),
-      setCleanMode: vi.fn(),
-      cleanAreas: vi.fn(),
-      destroy: vi.fn(),
-    } as unknown as RoborockVacuumClient,
+    client as unknown as RoborockVacuumClient,
   );
+
+  return { client, matter, vacuum };
+}
+
+function createVacuum(config: Partial<RoborockVacuumConfig> = {}): RoborockMatterVacuum {
+  return createVacuumFixture(config).vacuum;
 }
 
 function buildClusters(status?: RoborockStatus): any {
@@ -119,5 +125,57 @@ describe('RoborockMatterVacuum', () => {
         },
       },
     ]);
+  });
+
+  it('rejects unsupported run modes before sending a Roborock command', async () => {
+    const { client, vacuum } = createVacuumFixture();
+    const accessory = vacuum.buildAccessory({ state: 3, battery: 100, errorCode: 0 }) as any;
+
+    await expect(accessory.handlers.rvcRunMode.changeToMode({ newMode: 2 })).rejects.toThrow('Unsupported run mode');
+    expect(client.start).not.toHaveBeenCalled();
+    expect(client.pause).not.toHaveBeenCalled();
+    expect(client.cleanAreas).not.toHaveBeenCalled();
+  });
+
+  it('rejects room selections that span multiple Roborock maps', async () => {
+    const { matter, vacuum } = createVacuumFixture({
+      serviceMaps: [
+        { mapId: 1, name: 'Downstairs' },
+        { mapId: 2, name: 'Upstairs' },
+      ],
+      serviceAreas: [
+        { areaId: 100_017, label: 'Kitchen', mapId: 1, segmentId: 17 },
+        { areaId: 200_017, label: 'Bedroom', mapId: 2, segmentId: 17 },
+      ],
+    });
+    vacuum.restoreSelectedAreaIds([100_017]);
+    const accessory = vacuum.buildAccessory({ state: 3, battery: 100, errorCode: 0 }) as any;
+
+    await expect(accessory.handlers.serviceArea.selectAreas({
+      newAreas: [100_017, 200_017],
+    })).rejects.toThrow('one Roborock map');
+    expect(matter.updateAccessoryState).not.toHaveBeenCalled();
+    expect(accessory.context.selectedAreaIds).toEqual([100_017]);
+  });
+
+  it('removes only the requested room when Matter skips an area', async () => {
+    const { matter, vacuum } = createVacuumFixture({
+      serviceMaps: [{ mapId: 1, name: 'Downstairs' }],
+      serviceAreas: [
+        { areaId: 100_017, label: 'Kitchen', mapId: 1, segmentId: 17 },
+        { areaId: 100_018, label: 'Office', mapId: 1, segmentId: 18 },
+      ],
+    });
+    vacuum.restoreSelectedAreaIds([100_017, 100_018]);
+    const accessory = vacuum.buildAccessory({ state: 3, battery: 100, errorCode: 0 }) as any;
+
+    await accessory.handlers.serviceArea.skipArea({ skippedArea: 100_017 });
+
+    expect(matter.updateAccessoryState).toHaveBeenCalledWith(
+      vacuum.UUID,
+      'serviceArea',
+      { selectedAreas: [100_018] },
+    );
+    expect(accessory.context.selectedAreaIds).toEqual([100_018]);
   });
 });
