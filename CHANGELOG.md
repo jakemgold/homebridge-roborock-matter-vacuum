@@ -2,6 +2,10 @@
 
 All notable changes to this project will be documented in this file.
 
+## 0.7.1 - 2026-07-09
+
+- Reconnect the Roborock MQTT session after the first status acknowledgement timeout and retry immediately, reducing stale Apple Home state from multiple polling intervals to a single timeout plus reconnection.
+
 ## 0.7.0 - 2026-07-09
 
 - Added automatic Roborock MQTT reconnection after repeated status acknowledgement timeouts, allowing polling to recover from sessions that still appeared connected but stopped returning responses.

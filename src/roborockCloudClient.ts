@@ -88,7 +88,6 @@ const ROOM_MAPPING_STALE_RETRY_TIMEOUT_MS = 15_000;
 const ROOM_MAPPING_STALE_RETRY_INTERVAL_MS = 3_000;
 const ROBOROCK_NO_MAP_ID = 63;
 const MAP_SWITCH_SAFE_STATES = new Set([3, 8, 100]);
-const STATUS_TIMEOUTS_BEFORE_MQTT_RECOVERY = 3;
 
 export type CloudVacuumRegistration = {
   config: RoborockVacuumConfig;
@@ -1702,7 +1701,6 @@ export class RoborockCloudVacuumClient implements RoborockVacuumClient {
   private readonly statusListeners = new Set<RoborockStatusListener>();
   private readonly unsubscribeFromDpsUpdates: () => void;
   private mappedCleanToken = 0;
-  private consecutiveStatusTimeouts = 0;
 
   constructor(
     private readonly roborock: Roborock,
@@ -1720,7 +1718,6 @@ export class RoborockCloudVacuumClient implements RoborockVacuumClient {
 
     try {
       const payload = await this.call(statusRequest.method, statusRequest.params);
-      this.consecutiveStatusTimeouts = 0;
       return this.normalizeStatus(payload);
     } catch (error) {
       if (isCloudAckTimeout(error, statusRequest.method)) {
@@ -1738,7 +1735,6 @@ export class RoborockCloudVacuumClient implements RoborockVacuumClient {
 
     try {
       const payload = await this.call(statusRequest.fallbackMethod, statusRequest.fallbackParams);
-      this.consecutiveStatusTimeouts = 0;
       return this.normalizeStatus(payload);
     } catch (error) {
       if (isCloudAckTimeout(error, statusRequest.fallbackMethod)) {
@@ -1874,40 +1870,25 @@ export class RoborockCloudVacuumClient implements RoborockVacuumClient {
   }
 
   private async handleStatusTimeout(): Promise<boolean> {
-    this.consecutiveStatusTimeouts++;
-    if (this.consecutiveStatusTimeouts < STATUS_TIMEOUTS_BEFORE_MQTT_RECOVERY) {
-      return false;
-    }
-
     this.log.warn(
-      `Roborock status requests for ${this.config.name} timed out ${STATUS_TIMEOUTS_BEFORE_MQTT_RECOVERY} times; `
+      `A Roborock status request for ${this.config.name} timed out; `
       + 'reconnecting the cloud MQTT session.',
     );
 
     try {
       await this.roborock.recoverMqttConnection();
-      this.consecutiveStatusTimeouts = 0;
       this.log.info(`Roborock cloud MQTT session recovered for ${this.config.name}.`);
       return true;
     } catch (error) {
-      this.consecutiveStatusTimeouts = STATUS_TIMEOUTS_BEFORE_MQTT_RECOVERY - 1;
       this.log.warn(`Could not recover the Roborock cloud MQTT session for ${this.config.name}. ${formatRoborockError(error)}`);
       return false;
     }
   }
 
   private async retryStatusAfterRecovery(method: string, params: unknown[]): Promise<RoborockStatus> {
-    try {
-      const payload = await this.call(method, params);
-      this.consecutiveStatusTimeouts = 0;
-      this.log.info(`Roborock status responses recovered for ${this.config.name}.`);
-      return this.normalizeStatus(payload);
-    } catch (error) {
-      if (isCloudAckTimeout(error, method)) {
-        this.consecutiveStatusTimeouts = 1;
-      }
-      throw error;
-    }
+    const payload = await this.call(method, params);
+    this.log.info(`Roborock status responses recovered for ${this.config.name}.`);
+    return this.normalizeStatus(payload);
   }
 
   private async command(method: string, params: unknown[]): Promise<void> {

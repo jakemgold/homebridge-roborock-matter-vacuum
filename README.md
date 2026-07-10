@@ -79,13 +79,13 @@ npm install -g homebridge-roborock-matter-vacuum
 For a beta tarball build:
 
 ```sh
-npm install -g ./homebridge-roborock-matter-vacuum-0.7.0.tgz
+npm install -g ./homebridge-roborock-matter-vacuum-0.7.1.tgz
 ```
 
 If the tarball is hosted from another machine:
 
 ```sh
-npm install -g http://HOST:PORT/homebridge-roborock-matter-vacuum-0.7.0.tgz
+npm install -g http://HOST:PORT/homebridge-roborock-matter-vacuum-0.7.1.tgz
 ```
 
 Restart Homebridge after installing or updating the plugin.

@@ -159,24 +159,20 @@ describe('RoborockCloudVacuumClient map-specific cleaning', () => {
     expect(calls.map((call) => call.method)).not.toContain('app_segment_clean');
   });
 
-  it('reconnects MQTT after three consecutive status acknowledgement timeouts', async () => {
+  it('reconnects MQTT after the first status acknowledgement timeout and retries immediately', async () => {
     const recoverMqttConnection = vi.fn(async () => undefined);
     let attempts = 0;
     const client = vacuumClient(async (_duid, method) => {
       attempts++;
-      if (attempts === 4) {
+      if (attempts === 2) {
         return [{ state: 3, battery: 100 }];
       }
       throw new RoborockRequestTimeoutError(42, method, true, 10_000);
     }, recoverMqttConnection);
 
-    await expect(client.getStatus()).rejects.toBeInstanceOf(RoborockRequestTimeoutError);
-    await expect(client.getStatus()).rejects.toBeInstanceOf(RoborockRequestTimeoutError);
-    expect(recoverMqttConnection).not.toHaveBeenCalled();
-
     await expect(client.getStatus()).resolves.toMatchObject({ state: 3, battery: 100 });
     expect(recoverMqttConnection).toHaveBeenCalledTimes(1);
-    expect(attempts).toBe(4);
+    expect(attempts).toBe(2);
   });
 });
 
